@@ -119,21 +119,20 @@ class TransactionManager {
   // TODO(Tianyu): This is the famed HyPer Latch. We will need to re-evaluate performance later.
   common::SharedLatch commit_latch_;
 
-  // TODO(Matt): consider a different data structure if this becomes a measured bottleneck
-  std::unordered_set<timestamp_t> curr_running_txns_;
-  mutable common::SpinLatch curr_running_txns_latch_;
-
   // Maintain a list of TransactionThreadContexts
-  // Using forward_list because we won't need to iterate in both directions anytime.
   std::forward_list<TransactionThreadContext *> txn_thread_contexts_;
+  // Latch for adding workers to txn_thread_contexts_
+  mutable common::SpinLatch thread_contexts_latch_;
 
-  // Default TransactionThreadContext
+  // Default TransactionThreadContext for backward compatibility i.e. when
+  // TransactionThreadContext object is null in BeginTransaction
   TransactionThreadContext *default_worker_;
-  mutable common::SpinLatch default_worker_latch_;
-  mutable common::SpinLatch completed_txns_latch_;
 
   bool gc_enabled_ = false;
   TransactionQueue completed_txns_;
+  // Latch for the completed_txns_
+  mutable common::SpinLatch completed_txns_latch_;
+
   storage::LogManager *const log_manager_;
 
   timestamp_t ReadOnlyCommitCriticalSection(TransactionContext *txn, transaction::callback_fn callback,
