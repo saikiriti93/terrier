@@ -33,7 +33,7 @@ class SpinLatch {
   void Unlock() { latch_.unlock(); }
 
   /**
-   * Scoped spin latch that guaranteees releasing the lock when destructed.
+   * Scoped spin latch that guarantees releasing the lock when destructed.
    */
   class ScopedSpinLatch {
    public:
