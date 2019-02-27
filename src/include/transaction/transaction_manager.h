@@ -29,7 +29,22 @@ class TransactionManager {
    */
   TransactionManager(storage::RecordBufferSegmentPool *const buffer_pool, const bool gc_enabled,
                      storage::LogManager *log_manager)
-      : buffer_pool_(buffer_pool), gc_enabled_(gc_enabled), log_manager_(log_manager) {}
+      : buffer_pool_(buffer_pool), gc_enabled_(gc_enabled), log_manager_(log_manager) {
+    // Create a default TransactionThreadContext object
+    worker_id_t default_worker_id = worker_id_t(1000);
+    default_worker_ = new TransactionThreadContext(default_worker_id);
+
+    // Add the default_worker_ to the txn_thread_contexts_
+    // Not locking since constructor will only be called once.
+    txn_thread_contexts_.push_front(default_worker_);
+  }
+
+  // Delete the default_worker_ in the desctructor
+  ~TransactionManager() {
+    // Not locking since destructor will only be called once
+    txn_thread_contexts_.remove(default_worker_);
+    delete (default_worker_);
+  }
 
   /**
    * Registers a worker to the transaction manager, such that the transaction manager is aware of
@@ -113,7 +128,7 @@ class TransactionManager {
   std::forward_list<TransactionThreadContext *> txn_thread_contexts_;
 
   // Default TransactionThreadContext
-  // TransactionThreadContext default_worker_;
+  TransactionThreadContext *default_worker_;
   mutable common::SpinLatch default_worker_latch_;
   mutable common::SpinLatch completed_txns_latch_;
 

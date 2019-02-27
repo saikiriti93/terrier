@@ -10,6 +10,10 @@ TransactionContext *TransactionManager::BeginTransaction(TransactionThreadContex
   common::SharedLatch::ScopedSharedLatch guard(&commit_latch_);
   timestamp_t start_time = time_++;
 
+  // If no valid TransactionThreadContext is passed, use the default_worker to process this.
+  if (thread_context == nullptr) {
+    thread_context = default_worker_;
+  }
   // TODO(Tianyu):
   // Maybe embed this into the data structure, or use an object pool?
   // Doing this with std::map or other data structure is risky though, as they may not
@@ -59,7 +63,7 @@ void TransactionManager::UnregisterWorker(TransactionThreadContext *thread) {
     completed_txns_.splice_after(completed_txns_.cbefore_begin(), thread->completed_txns);
   }
   // LOG_INFO("Removed worker: {0:d}", (uint32_t)thread->getWorkerId());
-  delete(thread);
+  delete (thread);
 }
 
 void TransactionManager::LogCommit(TransactionContext *const txn, const timestamp_t commit_time,
