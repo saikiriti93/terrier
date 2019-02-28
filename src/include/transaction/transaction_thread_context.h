@@ -29,6 +29,7 @@ class TransactionThreadContext {
   mutable common::SpinLatch curr_running_txns_latch;
 
   TransactionQueue completed_txns;
+  mutable common::SpinLatch completed_txns_latch;
 
  private:
   // id of the worker thread on which the transaction start and finish.

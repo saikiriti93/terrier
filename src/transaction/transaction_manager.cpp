@@ -31,11 +31,12 @@ TransactionContext *TransactionManager::BeginTransaction(TransactionThreadContex
 }
 
 TransactionThreadContext *TransactionManager::RegisterWorker(worker_id_t worker_id) {
-  common::SpinLatch::ScopedSpinLatch workers_guard(&thread_contexts_latch_);
   auto transaction_thread_context = new TransactionThreadContext(worker_id);
-
   // Add it to the list of TransactionThreadContexts
-  txn_thread_contexts_.push_front(transaction_thread_context);
+  {
+    common::SpinLatch::ScopedSpinLatch workers_guard(&thread_contexts_latch_);
+    txn_thread_contexts_.push_front(transaction_thread_context);
+  }
   return transaction_thread_context;
 }
 
@@ -45,14 +46,16 @@ void TransactionManager::UnregisterWorker(TransactionThreadContext *thread) {
     txn_thread_contexts_.remove(thread);
   }
 
-  // To prevent commit or abort adding something to the thread->completed_txns.
-  // TODO(Kiriti): Change this to per_thread completed_txns_latch
-  common::SpinLatch::ScopedSpinLatch running_guard(&thread->curr_running_txns_latch);
-  // To protect the completed_txns_ access
-  common::SpinLatch::ScopedSpinLatch completed_guard(&completed_txns_latch_);
-  // Add the completed_txns in this thread to the manager's completed_txns.
-  if (!thread->completed_txns.empty()) {
-    completed_txns_.splice_after(completed_txns_.cbefore_begin(), thread->completed_txns);
+  {
+    // To prevent commit or abort adding something to the thread->completed_txns.
+    common::SpinLatch::ScopedSpinLatch running_guard(&thread->completed_txns_latch);
+    // To protect the global completed_txns_ access
+    common::SpinLatch::ScopedSpinLatch completed_guard(&completed_txns_latch_);
+    // Add the completed_txns in this thread to the global completed_txns.
+    if (!thread->completed_txns.empty()) {
+      completed_txns_.splice_after(completed_txns_.cbefore_begin(), thread->completed_txns);
+      TERRIER_ASSERT(thread->completed_txns.empty(), "Completed transactions not emptied in unregister worker");
+    }
   }
   delete (thread);
 }
@@ -121,18 +124,22 @@ timestamp_t TransactionManager::Commit(TransactionContext *const txn, transactio
                                        void *callback_arg) {
   const timestamp_t result = txn->undo_buffer_.Empty() ? ReadOnlyCommitCriticalSection(txn, callback, callback_arg)
                                                        : UpdatingCommitCriticalSection(txn, callback, callback_arg);
+  auto worker_thread = txn->worker_thread_;
+  const timestamp_t start_time = txn->StartTime();
   {
     // Get the TransactionThreadContext object associated with the txn
-    auto worker_thread = txn->worker_thread_;
     common::SpinLatch::ScopedSpinLatch running_guard(&worker_thread->curr_running_txns_latch);
 
     // In a critical section, remove this transaction from the table of running transactions
-    const timestamp_t start_time = txn->StartTime();
     const size_t ret UNUSED_ATTRIBUTE = worker_thread->curr_running_txns.erase(start_time);
     TERRIER_ASSERT(ret == 1, "Committed transaction did not exist in global transactions table");
     // It is not necessary to have to GC process read-only transactions, but it's probably faster to call free off
     // the critical path there anyway
     // Also note here that GC will figure out what varlen entries to GC, as opposed to in the abort case.
+  }
+  {
+    // We are modifying only completed_txns of the worker. So no lock required over the curr_running_txns
+    common::SpinLatch::ScopedSpinLatch completed_guard(&worker_thread->completed_txns_latch);
     if (gc_enabled_) worker_thread->completed_txns.push_front(txn);
   }
   return result;
@@ -147,14 +154,18 @@ void TransactionManager::Abort(TransactionContext *const txn) {
   // Discard the redo buffer that is not yet logged out
   txn->redo_buffer_.Finalize(false);
   txn->log_processed_ = true;
+  auto worker_thread = txn->worker_thread_;
+  const timestamp_t start_time = txn->StartTime();
   {
     // In a critical section, remove this transaction from the table of running transactions
-    auto worker_thread = txn->worker_thread_;
     common::SpinLatch::ScopedSpinLatch running_guard(&worker_thread->curr_running_txns_latch);
-    const timestamp_t start_time = txn->StartTime();
     const size_t ret UNUSED_ATTRIBUTE = worker_thread->curr_running_txns.erase(start_time);
     TERRIER_ASSERT(ret == 1, "Aborted transaction did not exist in thread transactions table");
     // Add the transaction to the list of completed transactions of the corresponding thread.
+  }
+  {
+    // We are modifying only completed_txns of the worker. So no lock required over the curr_running_txns
+    common::SpinLatch::ScopedSpinLatch completed_guard(&worker_thread->completed_txns_latch);
     if (gc_enabled_) worker_thread->completed_txns.push_front(txn);
   }
 }
@@ -219,18 +230,23 @@ timestamp_t TransactionManager::OldestTransactionStartTime() const {
 
 TransactionQueue TransactionManager::CompletedTransactionsForGC() {
   // Collect all the completed transactions
+  // Lock it to ensure that commit and abort are not adding to this list.
+  TransactionQueue temp_completed_txns;
   {
     common::SpinLatch::ScopedSpinLatch workers_guard(&thread_contexts_latch_);
     for (auto const &worker_thread : txn_thread_contexts_) {
-      common::SpinLatch::ScopedSpinLatch running_guard(&worker_thread->curr_running_txns_latch);
-      completed_txns_.splice_after(completed_txns_.cbefore_begin(), worker_thread->completed_txns);
+      common::SpinLatch::ScopedSpinLatch completed_guard(&worker_thread->completed_txns_latch);
+      // completed_txns_.splice_after(completed_txns_.cbefore_begin(), worker_thread->completed_txns);
+      temp_completed_txns.splice_after(temp_completed_txns.cbefore_begin(), worker_thread->completed_txns);
       TERRIER_ASSERT(worker_thread->completed_txns.empty(), "Splicing not working for removing elements");
     }
   }
 
   // Handover the completed transactions to GC.
-  // Lock it to ensure that commit and abort are not adding to this list.
-  common::SpinLatch::ScopedSpinLatch completed_guard(&completed_txns_latch_);
+  common::SpinLatch::ScopedSpinLatch global_completed_guard(&completed_txns_latch_);
+  if (!temp_completed_txns.empty()) {
+    completed_txns_.splice_after(completed_txns_.cbefore_begin(), temp_completed_txns);
+  }
   TransactionQueue hand_to_gc(std::move(completed_txns_));
   TERRIER_ASSERT(completed_txns_.empty(), "Handing over to GC not emptying completed transactions");
   return hand_to_gc;
